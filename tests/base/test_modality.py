@@ -671,6 +671,42 @@ class TestParseInputs:
         assert modality == "video"
         assert dict(extra) == {}
 
+    @pytest.mark.parametrize("wrapped_frames", [False, True])
+    def test_multiple_videos_each_carry_their_own_metadata(self, wrapped_frames):
+        """Multiple pre-sampled videos in one batch keep their own fps/frames_indices metadata.
+
+        Models like Qwen3-VL read per-video ``fps``/``frames_indices`` to timestamp frames, so the
+        metadata list must stay video-aligned when several preloaded videos are encoded in one call.
+        The metadata can only travel with the array-dict form; frame-list videos without a dict
+        carry no metadata (and get frame-count defaults inferred by the reconciliation).
+        https://github.com/huggingface/sentence-transformers/issues/3864
+        """
+        frames_a = [np.zeros((3, 8, 8)) for _ in range(4)]
+        frames_b = np.ones((6, 3, 8, 8))
+        metadata_a = {"fps": 15, "total_num_frames": 12, "frames_indices": [0, 5, 10]}
+        metadata_b = {"fps": 24, "total_num_frames": 20, "frames_indices": [0, 4, 8, 12, 16, 19]}
+        video_a = (
+            {"array": frames_a, "video_metadata": metadata_a}
+            if wrapped_frames
+            else {"array": frames_a, "video_metadata": None}
+        )
+        samples = [
+            {"video": video_a},
+            {"video": {"array": frames_b, "video_metadata": metadata_b}},
+        ]
+        modality, inputs, extra = self.fmt.parse_inputs(samples)
+        assert modality == "video"
+        assert len(inputs["video"]) == 2
+        metadata = extra["video"]["video_metadata"]
+        if wrapped_frames:
+            # Each metadata entry is exactly what its video carried; nothing inferred, nothing shifted
+            assert metadata == [metadata_a, metadata_b]
+        else:
+            # The metadata-less frame-list video gets frame-count defaults, the wrapped one keeps its own
+            assert metadata[0]["total_num_frames"] == 4
+            assert metadata[0]["frames_indices"] == [0, 1, 2, 3]
+            assert metadata[1] == metadata_b
+
     @pytest.mark.parametrize("container", [list, tuple])
     @pytest.mark.parametrize("wrapped_frames", [False, True])
     def test_video_collection_metadata_matches_each_content_item(self, container, wrapped_frames):

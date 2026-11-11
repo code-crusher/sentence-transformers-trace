@@ -3,6 +3,7 @@ from __future__ import annotations
 import inspect
 import json
 import logging
+import re
 import sys
 from copy import deepcopy
 from pathlib import Path
@@ -32,6 +33,7 @@ transformer_module = sys.modules[Transformer.__module__]
 TINY_BERT = "sentence-transformers-testing/stsb-bert-tiny-safetensors"
 TINY_LLAMA = "hf-internal-testing/tiny-random-LlamaForCausalLM"
 TINY_LLAVA = "hf-internal-testing/tiny-random-LlavaForConditionalGeneration"
+TINY_QWEN3_VL = "huggingface-mic/Qwen3-VL-2B-Instruct-mic"
 TINY_XLMR = "hf-internal-testing/tiny-xlm-roberta"
 TINY_ALTCLIP = "hf-internal-testing/tiny-random-AltCLIPModel"
 
@@ -784,6 +786,47 @@ class TestPreprocess:
             [{"text": "a", "image": image}, {"text": "text only"}, {"text": "b", "image": [image, image]}]
         )
         assert features["num_images_per_sample"].tolist() == [1, 0, 2]
+
+    @pytest.mark.skipif(
+        Version(transformers_version) < Version("5.0.0"), reason="any-to-any requires transformers v5+"
+    )
+    @pytest.mark.skipif(
+        not (is_vision_available() and is_torchvision_available()),
+        reason="Loading the Qwen3-VL processor requires Pillow and torchvision",
+    )
+    def test_multiple_pre_sampled_videos_keep_their_own_metadata(self):
+        """Several pre-sampled videos in one batch each carry their own fps/frames_indices metadata.
+
+        Qwen3-VL renders per-frame timestamps from that metadata, so a mix-up would silently attach
+        the wrong timestamps to a video. Each video's metadata must reach the processor video-aligned.
+        https://github.com/huggingface/sentence-transformers/issues/3864
+        """
+        transformer = Transformer(
+            TINY_QWEN3_VL,
+            transformer_task="any-to-any",
+            processing_kwargs={"video": {"do_sample_frames": False, "cap_pixels_per_frame": False}},
+        )
+        tokenizer = transformer.processor.tokenizer
+
+        def decoded_timestamps(features, sample_idx):
+            tokens = features["input_ids"][sample_idx, features["attention_mask"][sample_idx].bool()]
+            rendered = tokenizer.decode(tokens)
+            return [float(t) for t in re.findall(r"<([\d.]+) seconds>", rendered)]
+
+        frames_a = (np.random.rand(4, 32, 32, 3) * 255).astype(np.uint8)
+        frames_b = (np.random.rand(4, 32, 32, 3) * 255).astype(np.uint8)
+        metadata_a = {"fps": 2, "total_num_frames": 8, "frames_indices": [0, 2, 4, 6]}
+        metadata_b = {"fps": 8, "total_num_frames": 8, "frames_indices": [0, 1, 2, 3]}
+        samples = [
+            {"video": {"array": frames_a, "video_metadata": metadata_a}},
+            {"video": {"array": frames_b, "video_metadata": metadata_b}},
+        ]
+        features = transformer.preprocess(samples)
+        assert features["num_videos_per_sample"].tolist() == [1, 1]
+        # frames_indices / fps drive the rendered timestamps, averaged pairwise per temporal patch of 2:
+        # [0, 2, 4, 6] at fps 2 -> (0.0 + 1.0)/2, (2.0 + 3.0)/2; [0, 1, 2, 3] at fps 8 -> 0.1, 0.3 (rendered %.1f)
+        assert decoded_timestamps(features, 0) == [0.5, 2.5]
+        assert decoded_timestamps(features, 1) == [0.1, 0.3]
 
 
 class TestForward:
